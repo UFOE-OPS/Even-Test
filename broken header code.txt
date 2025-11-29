@@ -14,6 +14,8 @@
       showDistance:
         parseInt(header.getAttribute("data-show-distance"), 10) || 150,
       topSlack: 8, // treat small offsets from top as "at top"
+      bannerCatchDistance:
+        parseInt(header.getAttribute("data-banner-snap"), 10) || 120,
     };
 
     var headerRect = header.getBoundingClientRect();
@@ -98,6 +100,17 @@
       if (newDirection !== direction) {
         direction = newDirection;
         baseline = current;
+      }
+
+      if (
+        direction === "up" &&
+        current <= initialOffset + config.bannerCatchDistance
+      ) {
+        pinToBanner(current);
+        baseline = current;
+        lastScrollY = current;
+        ticking = false;
+        return;
       }
 
       if (direction === "down") {
