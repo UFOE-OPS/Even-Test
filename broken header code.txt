@@ -1,0 +1,77 @@
+<script>
+(function () {
+  var header = document.getElementById("hide-header");
+  if (!header) return;
+
+  // CONFIG
+  var BANNER_OFFSET = 65;  // space for the top banner
+  var HIDE_DELAY    = 60;  // how far you scroll DOWN before header hides
+  var TOP_THRESHOLD = 5;   // treat 0–5px as "top of page"
+
+  // Base styles (no external CSS needed)
+  header.style.position   = "fixed";
+  header.style.top        = "0";
+  header.style.left       = "0";
+  header.style.right      = "1.5%";
+  header.style.zIndex     = "199";
+  header.style.transition = "transform 0.45s ease";
+  header.style.willChange = "transform";
+
+  var lastScroll    = window.pageYOffset || document.documentElement.scrollTop;
+  var lastToggle    = lastScroll;
+  var headerVisible = true;
+  var waitingToHide = false;
+
+  function updateHeader() {
+    var current = window.pageYOffset || document.documentElement.scrollTop;
+    var diff    = current - lastScroll;
+
+    // 1) AT VERY TOP: always sit at banner height
+    if (current <= TOP_THRESHOLD) {
+      header.style.transform = "translateY(" + BANNER_OFFSET + "px)";
+      headerVisible = true;
+      waitingToHide = false;
+      lastToggle    = current;
+      lastScroll    = current;
+      return;
+    }
+
+    // Ignore tiny jitter away from top
+    if (Math.abs(diff) < 2) {
+      lastScroll = current;
+      return;
+    }
+
+    if (diff < 0) {
+      // 🔼 SCROLLING UP (in content) → show at top
+      headerVisible = true;
+      waitingToHide = false;
+      header.style.transform = "translateY(0)";
+      lastToggle    = current;
+
+    } else {
+      // 🔽 SCROLLING DOWN (in content)
+      if (!waitingToHide) {
+        // First bit of downward scroll in this run
+        waitingToHide = true;
+        headerVisible = true;
+        header.style.transform = "translateY(0)";
+        lastToggle    = current;
+      } else if (headerVisible && current - lastToggle > HIDE_DELAY) {
+        // Scrolled down enough → hide header
+        header.style.transform = "translateY(-100%)";
+        headerVisible = false;
+        lastToggle    = current;
+      }
+    }
+
+    lastScroll = current;
+  }
+
+  // Initial position on load
+  updateHeader();
+
+  // Update on scroll
+  window.addEventListener("scroll", updateHeader, { passive: true });
+})();
+</script>
