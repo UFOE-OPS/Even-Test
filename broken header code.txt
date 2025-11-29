@@ -44,27 +44,36 @@
     var direction = null;
     var baseline = lastScrollY;
     var hidden = false;
+    var bannerLocked = false;
     var ticking = false;
 
     function setTransform(value) {
       header.style.transform = "translate3d(0," + Math.round(value) + "px,0)";
     }
 
-    function pinToBanner(scrollY) {
+    function pinToBanner(scrollY, hardLock) {
       hidden = false;
       header.style.opacity = "1";
+      if (hardLock) {
+        bannerLocked = true;
+        setTransform(initialOffset);
+        return;
+      }
+      if (bannerLocked) bannerLocked = false;
       var offset = Math.max(initialOffset - scrollY, 0);
       setTransform(offset);
     }
 
     function pinToTop() {
       hidden = false;
+      bannerLocked = false;
       header.style.opacity = "1";
       setTransform(0);
     }
 
     function hideHeader() {
       hidden = true;
+      bannerLocked = false;
       header.style.opacity = "0";
       setTransform(-headerHeight - 12);
     }
@@ -88,7 +97,7 @@
       }
 
       if (current <= initialOffset + config.topSlack) {
-        pinToBanner(current);
+        pinToBanner(current, false);
         direction = null;
         baseline = current;
         lastScrollY = current;
@@ -103,10 +112,10 @@
       }
 
       if (
-        direction === "up" &&
+        (direction === "up" || bannerLocked) &&
         current <= initialOffset + config.bannerCatchDistance
       ) {
-        pinToBanner(current);
+        pinToBanner(current, true);
         baseline = current;
         lastScrollY = current;
         ticking = false;
@@ -147,7 +156,7 @@
       var current = getScrollY();
 
       if (current <= initialOffset + config.topSlack) {
-        pinToBanner(current);
+        pinToBanner(current, bannerLocked);
       } else if (wasHidden) {
         hideHeader();
       } else {
