@@ -3,75 +3,146 @@
   var header = document.getElementById("hide-header");
   if (!header) return;
 
-  // CONFIG
-  var BANNER_OFFSET = 65;  // space for the top banner
-  var HIDE_DELAY    = 60;  // how far you scroll DOWN before header hides
-  var TOP_THRESHOLD = 5;   // treat 0–5px as "top of page"
+  var getScrollY = function () {
+    return window.pageYOffset || document.documentElement.scrollTop || 0;
+  };
 
-  // Base styles (no external CSS needed)
-  header.style.position   = "fixed";
-  header.style.top        = "0";
-  header.style.left       = "0";
-  header.style.right      = "1.5%";
-  header.style.zIndex     = "199";
-  header.style.transition = "transform 0.45s ease";
+  var config = {
+    hideDistance:
+      parseInt(header.getAttribute("data-hide-distance"), 10) || 50,
+    showDistance:
+      parseInt(header.getAttribute("data-show-distance"), 10) || 150,
+    topSlack: 8, // treat small offsets from top as "at top"
+  };
+
+  var headerRect = header.getBoundingClientRect();
+  var headerHeight = headerRect.height;
+  var initialOffset = Math.round(headerRect.top + getScrollY());
+  var placeholder = document.createElement("div");
+  placeholder.style.width = "100%";
+  placeholder.style.height = headerHeight + "px";
+  placeholder.style.pointerEvents = "none";
+  header.parentNode.insertBefore(placeholder, header);
+
+  header.style.position = "fixed";
+  header.style.top = "0";
+  header.style.left = "0";
+  header.style.right = "0";
+  header.style.width = "100%";
+  header.style.zIndex = header.style.zIndex || "199";
   header.style.willChange = "transform";
+  header.style.transition =
+    "transform 0.45s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease-out";
+  header.style.transform = "translate3d(0," + initialOffset + "px,0)";
+  header.style.opacity = "1";
 
-  var lastScroll    = window.pageYOffset || document.documentElement.scrollTop;
-  var lastToggle    = lastScroll;
-  var headerVisible = true;
-  var waitingToHide = false;
+  var lastScrollY = getScrollY();
+  var latestScrollY = lastScrollY;
+  var direction = null;
+  var baseline = lastScrollY;
+  var hidden = false;
+  var ticking = false;
 
-  function updateHeader() {
-    var current = window.pageYOffset || document.documentElement.scrollTop;
-    var diff    = current - lastScroll;
+  function setTransform(value) {
+    header.style.transform = "translate3d(0," + Math.round(value) + "px,0)";
+  }
 
-    // 1) AT VERY TOP: always sit at banner height
-    if (current <= TOP_THRESHOLD) {
-      header.style.transform = "translateY(" + BANNER_OFFSET + "px)";
-      headerVisible = true;
-      waitingToHide = false;
-      lastToggle    = current;
-      lastScroll    = current;
+  function pinToBanner(scrollY) {
+    hidden = false;
+    header.style.opacity = "1";
+    var offset = Math.max(initialOffset - scrollY, 0);
+    setTransform(offset);
+  }
+
+  function pinToTop() {
+    hidden = false;
+    header.style.opacity = "1";
+    setTransform(0);
+  }
+
+  function hideHeader() {
+    hidden = true;
+    header.style.opacity = "0";
+    setTransform(-headerHeight - 12);
+  }
+
+  function measureFromPlaceholder() {
+    headerHeight = header.offsetHeight;
+    placeholder.style.height = headerHeight + "px";
+    initialOffset = Math.round(
+      placeholder.getBoundingClientRect().top + getScrollY()
+    );
+  }
+
+  function update() {
+    var current = latestScrollY;
+    var delta = current - lastScrollY;
+
+    if (Math.abs(delta) < 1) {
+      lastScrollY = current;
+      ticking = false;
       return;
     }
 
-    // Ignore tiny jitter away from top
-    if (Math.abs(diff) < 2) {
-      lastScroll = current;
+    if (current <= initialOffset + config.topSlack) {
+      pinToBanner(current);
+      direction = null;
+      baseline = current;
+      lastScrollY = current;
+      ticking = false;
       return;
     }
 
-    if (diff < 0) {
-      // 🔼 SCROLLING UP (in content) → show at top
-      headerVisible = true;
-      waitingToHide = false;
-      header.style.transform = "translateY(0)";
-      lastToggle    = current;
+    var newDirection = delta > 0 ? "down" : "up";
+    if (newDirection !== direction) {
+      direction = newDirection;
+      baseline = current;
+    }
 
+    if (direction === "down") {
+      var travelledDown = current - baseline;
+      if (!hidden && travelledDown >= config.hideDistance) {
+        hideHeader();
+        baseline = current;
+      }
     } else {
-      // 🔽 SCROLLING DOWN (in content)
-      if (!waitingToHide) {
-        // First bit of downward scroll in this run
-        waitingToHide = true;
-        headerVisible = true;
-        header.style.transform = "translateY(0)";
-        lastToggle    = current;
-      } else if (headerVisible && current - lastToggle > HIDE_DELAY) {
-        // Scrolled down enough → hide header
-        header.style.transform = "translateY(-100%)";
-        headerVisible = false;
-        lastToggle    = current;
+      var travelledUp = baseline - current;
+      if (hidden && travelledUp >= config.showDistance) {
+        pinToTop();
+        baseline = current;
+      } else if (!hidden) {
+        pinToTop();
       }
     }
 
-    lastScroll = current;
+    lastScrollY = current;
+    ticking = false;
   }
 
-  // Initial position on load
-  updateHeader();
+  function onScroll() {
+    latestScrollY = getScrollY();
+    if (!ticking) {
+      ticking = true;
+      window.requestAnimationFrame(update);
+    }
+  }
 
-  // Update on scroll
-  window.addEventListener("scroll", updateHeader, { passive: true });
+  function onResize() {
+    var wasHidden = hidden;
+    measureFromPlaceholder();
+    var current = getScrollY();
+
+    if (current <= initialOffset + config.topSlack) {
+      pinToBanner(current);
+    } else if (wasHidden) {
+      hideHeader();
+    } else {
+      pinToTop();
+    }
+  }
+
+  pinToBanner(getScrollY());
+  window.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("resize", onResize);
 })();
 </script>
