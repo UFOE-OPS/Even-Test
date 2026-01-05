@@ -31,6 +31,7 @@ class FetchResult:
     final_url: str
     html: str
     used_playwright: bool
+    extracted: Optional[dict[str, Any]] = None
 
 
 def sha256_text(text: str) -> str:
@@ -70,7 +71,13 @@ def fetch_html_requests(url: str, timeout_s: int = 30) -> FetchResult:
     )
     resp.raise_for_status()
     html = resp.text
-    return FetchResult(url=url, final_url=str(resp.url), html=html, used_playwright=False)
+    return FetchResult(
+        url=url,
+        final_url=str(resp.url),
+        html=html,
+        used_playwright=False,
+        extracted=None,
+    )
 
 
 def fetch_html_playwright(url: str, timeout_s: int = 45) -> FetchResult:
@@ -84,11 +91,104 @@ def fetch_html_playwright(url: str, timeout_s: int = 45) -> FetchResult:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_s * 1000)
         # Let JS settle (Fragrantica often renders parts after DOMContentLoaded).
         page.wait_for_timeout(1500)
+        extracted = page.evaluate(
+            """
+            () => {
+              const norm = (s) => (s || "").replace(/\\s+/g, " ").trim();
+              const textEq = (el, target) => norm(el?.innerText).toLowerCase() === target.toLowerCase();
+
+              const findLabelEl = (label) => {
+                const target = label.toLowerCase();
+                // Prefer short elements
+                const els = Array.from(document.querySelectorAll("span,div,li,strong,em,p,a,td,th,label,h1,h2,h3"));
+                for (const el of els) {
+                  if (!el) continue;
+                  const t = norm(el.innerText).toLowerCase();
+                  if (t === target) return el;
+                }
+                return null;
+              };
+
+              const percentFromStyle = (el) => {
+                if (!el) return null;
+                const w = (el.style && el.style.width) ? el.style.width : "";
+                const m = /([0-9]{1,3})\\s*%/.exec(w);
+                if (m) {
+                  const v = parseInt(m[1], 10);
+                  if (!isNaN(v) && v >= 0 && v <= 100) return v;
+                }
+                return null;
+              };
+
+              const percentFromGeometry = (bar, container) => {
+                try {
+                  const b = bar.getBoundingClientRect();
+                  const c = container.getBoundingClientRect();
+                  if (!c.width || c.width <= 0) return null;
+                  const v = Math.round((b.width / c.width) * 100);
+                  if (v >= 0 && v <= 100) return v;
+                } catch (e) {}
+                return null;
+              };
+
+              const findBarNear = (labelEl) => {
+                if (!labelEl) return null;
+                // Search within a small ancestor scope for a plausible bar element.
+                let scope = labelEl.parentElement;
+                for (let up = 0; up < 4 && scope; up++) {
+                  const divs = Array.from(scope.querySelectorAll("div,span"));
+                  // Heuristic: thin-ish, non-empty elements often represent bars.
+                  let best = null;
+                  let bestWidth = 0;
+                  for (const d of divs) {
+                    const r = d.getBoundingClientRect();
+                    if (r.width > bestWidth && r.height >= 3 && r.height <= 40) {
+                      best = d;
+                      bestWidth = r.width;
+                    }
+                  }
+                  if (best) return best;
+                  scope = scope.parentElement;
+                }
+                return null;
+              };
+
+              const getPct = (label) => {
+                const labelEl = findLabelEl(label);
+                if (!labelEl) return null;
+                const bar = findBarNear(labelEl);
+                if (!bar) return null;
+                const fromStyle = percentFromStyle(bar);
+                if (fromStyle !== null) return fromStyle;
+                const container = bar.parentElement || labelEl.parentElement;
+                return container ? percentFromGeometry(bar, container) : null;
+              };
+
+              const h1 = norm(document.querySelector("h1")?.innerText);
+              return {
+                h1,
+                seasonality: {
+                  spring: getPct("Spring"),
+                  summer: getPct("Summer"),
+                  fall: getPct("Fall") ?? getPct("Autumn"),
+                  winter: getPct("Winter"),
+                },
+                daynight: { day: getPct("Day"), night: getPct("Night") },
+              };
+            }
+            """
+        )
         html = page.content()
         final_url = page.url
         ctx.close()
         browser.close()
-    return FetchResult(url=url, final_url=final_url, html=html, used_playwright=True)
+    return FetchResult(
+        url=url,
+        final_url=final_url,
+        html=html,
+        used_playwright=True,
+        extracted=extracted if isinstance(extracted, dict) else None,
+    )
 
 
 def fetch_html(url: str, allow_playwright_fallback: bool = True) -> FetchResult:
@@ -226,36 +326,217 @@ def extract_season_daynight_percent(html: str) -> dict[str, dict[str, Optional[i
     }
 
 
-def extract_main_accords(soup: BeautifulSoup) -> list[str]:
-    # Best-effort: look for a section containing “Main accords” and harvest nearby short tokens.
-    txt = soup.get_text("\n", strip=True)
-    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+def clean_name_from_heading(h1_text: str, brand: Optional[str]) -> tuple[Optional[str], dict[str, Any]]:
+    """
+    Try to extract a clean product name from the page H1, plus optional structured fields.
+    Example input:
+      "Paradigme Prada cologne - a new fragrance for men 2025"
+    Output:
+      name="Paradigme", extras={"gender":"men","year":2025,"concentration":"cologne"}
+    """
+    if not h1_text:
+        return None, {}
+    t = re.sub(r"\s+", " ", h1_text).strip()
+
+    extras: dict[str, Any] = {}
+
+    # Peel off SEO tail.
+    t = re.split(r"\s+-\s+", t, maxsplit=1)[0].strip()
+
+    # Gender
+    m_gender = re.search(r"\bfor\s+(men|women|men and women|unisex)\b", t, flags=re.I)
+    if m_gender:
+        g = m_gender.group(1).lower()
+        extras["gender"] = "unisex" if "men and women" in g else g
+        t = re.sub(r"\s*\bfor\s+(men|women|men and women|unisex)\b\s*", " ", t, flags=re.I).strip()
+
+    # Year
+    m_year = re.search(r"\b(19\d{2}|20\d{2})\b", t)
+    if m_year:
+        try:
+            extras["year"] = int(m_year.group(1))
+            t = re.sub(r"\b(19\d{2}|20\d{2})\b", "", t).strip()
+        except Exception:
+            pass
+
+    # Concentration (best-effort)
+    m_conc = re.search(
+        r"\b(parfum|extrait|edp|eau de parfum|edt|eau de toilette|cologne|eau de cologne)\b",
+        t,
+        flags=re.I,
+    )
+    if m_conc:
+        conc = m_conc.group(1).lower()
+        conc = {
+            "edp": "eau de parfum",
+            "edt": "eau de toilette",
+        }.get(conc, conc)
+        extras["concentration"] = conc
+        t = re.sub(
+            r"\b(parfum|extrait|edp|eau de parfum|edt|eau de toilette|cologne|eau de cologne)\b",
+            "",
+            t,
+            flags=re.I,
+        ).strip()
+
+    # If brand appears in H1, take left side as the name.
+    if brand:
+        b = re.sub(r"\s+", " ", brand).strip()
+        idx = t.lower().find(b.lower())
+        if idx > 0:
+            left = t[:idx].strip()
+            if left:
+                return left, extras
+
+    # Otherwise: take the first chunk before common separators.
+    t2 = re.split(r"\s+\bby\b\s+|\s+\(|\s+–\s+|\s+-\s+", t, maxsplit=1)[0].strip()
+    return (t2 or None), extras
+
+
+def extract_name_from_dom(soup: BeautifulSoup, brand: Optional[str]) -> tuple[Optional[str], dict[str, Any]]:
+    # Prefer an actual H1 rather than og:title / <title> (which often include SEO text).
+    h1 = soup.select_one("h1")
+    h1_text = text_of(h1) or ""
+    return clean_name_from_heading(h1_text, brand=brand)
+
+
+def is_valid_accord_label(label: str) -> bool:
+    l = re.sub(r"\s+", " ", (label or "")).strip()
+    if not l:
+        return False
+    if len(l) > 30:
+        return False
+    bad = {
+        "i have it",
+        "i had it",
+        "i want it",
+        "sponsored",
+        "love",
+        "like",
+        "ok",
+        "dislike",
+        "hate",
+        "winter",
+        "spring",
+        "summer",
+        "fall",
+        "autumn",
+        "day",
+        "night",
+    }
+    if l.lower() in bad:
+        return False
+    if re.search(r"\b(votes?|rating|reviews?)\b", l, flags=re.I):
+        return False
+    # Only allow simple label-like strings.
+    if not re.fullmatch(r"[A-Za-z][A-Za-z '\-]{0,29}", l):
+        return False
+    return True
+
+
+def extract_main_accords_dom(soup: BeautifulSoup) -> list[str]:
+    """
+    Parse main accords from the accord bar DOM, not from page text (avoids UI/widget pollution).
+    """
     out: list[str] = []
-    for i, ln in enumerate(lines):
-        if ln.lower() == "main accords":
-            # Take the next ~20 lines, keep ones that look like accord labels.
-            for ln2 in lines[i + 1 : i + 25]:
-                if len(ln2) > 30:
-                    continue
-                if re.search(r"\d", ln2):
-                    continue
-                if ln2.lower() in ("top notes", "middle notes", "base notes"):
-                    break
-                # Avoid UI boilerplate
-                if ln2.lower() in ("report fragrance", "add to my wardrobe", "own it", "i have it"):
-                    continue
-                out.append(ln2)
-            break
+    # Look for elements whose class mentions "accord" and whose style indicates a bar width.
+    for el in soup.find_all(True, class_=re.compile(r"accord", flags=re.I)):
+        style = (el.get("style") or "").lower()
+        if not re.search(r"width\s*:\s*\d{1,3}\s*%", style):
+            continue
+        label = el.get_text(" ", strip=True)
+        if not is_valid_accord_label(label):
+            continue
+        out.append(re.sub(r"\s+", " ", label).strip())
+
+    # Fallback: sometimes the label is in a nested span within the bar element.
+    if not out:
+        for bar in soup.select('[style*="width"]'):
+            style = (bar.get("style") or "").lower()
+            if "width" not in style or "%" not in style:
+                continue
+            cls = " ".join(bar.get("class") or [])
+            if not re.search(r"accord", cls, flags=re.I):
+                continue
+            label = bar.get_text(" ", strip=True)
+            if is_valid_accord_label(label):
+                out.append(re.sub(r"\s+", " ", label).strip())
+
     # De-dupe while keeping order
     seen: set[str] = set()
-    deduped = []
+    dedup: list[str] = []
     for a in out:
         k = a.lower()
         if k in seen:
             continue
         seen.add(k)
-        deduped.append(a)
-    return deduped[:15]
+        dedup.append(a)
+    return dedup[:15]
+
+
+def filter_perfume_image_urls(image_urls: list[str], perfume_id: str) -> list[str]:
+    """
+    Keep only perfume-specific images and explicitly exclude known noise.
+    Priority:
+      1) hero 375x500.<ID> or m.<ID>
+      2) perfume-social-cards with <ID>
+      3) photogram images (fimgs.net/photogram), limited
+    """
+    pid = (perfume_id or "").strip()
+
+    def is_noise(u: str) -> bool:
+        return any(
+            s in u
+            for s in (
+                "/mdimg/news/",
+                "/mdimg/sastojci/",
+                "/mdimg/perfume-thumbs/s.",
+            )
+        )
+
+    def is_hero_375(u: str) -> bool:
+        if not pid:
+            return False
+        return bool(re.search(rf"/mdimg/perfume-thumbs/375x500\.{re.escape(pid)}\.", u))
+
+    def is_hero_m(u: str) -> bool:
+        if not pid:
+            return False
+        return bool(re.search(rf"/mdimg/perfume/m\.{re.escape(pid)}\.", u))
+
+    def is_social(u: str) -> bool:
+        return bool(pid and ("/mdimg/perfume-social-cards/" in u) and (pid in u))
+
+    def is_photogram(u: str) -> bool:
+        return "fimgs.net/photogram/" in u
+
+    def is_wrong_other_perfume(u: str) -> bool:
+        if not pid:
+            return False
+        m = re.search(r"/mdimg/perfume/(?:m|s)\.(\d+)\.", u)
+        return bool(m and m.group(1) != pid)
+
+    cleaned = [u for u in image_urls if isinstance(u, str)]
+    cleaned = [u for u in cleaned if not is_noise(u)]
+    cleaned = [u for u in cleaned if not is_wrong_other_perfume(u)]
+
+    hero = [u for u in cleaned if is_hero_375(u)] + [u for u in cleaned if is_hero_m(u)]
+    social = [u for u in cleaned if is_social(u)]
+    photogram = [u for u in cleaned if is_photogram(u)]
+
+    # Keep order but de-dupe.
+    out: list[str] = []
+    seen: set[str] = set()
+    for group, limit in ((hero, 2), (social, 3), (photogram, 10)):
+        for u in group[:limit]:
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append(u)
+    return out
+
+def extract_main_accords(soup: BeautifulSoup) -> list[str]:
+    return extract_main_accords_dom(soup)
 
 
 def extract_notes(soup: BeautifulSoup) -> dict[str, list[str]]:
@@ -295,7 +576,9 @@ def extract_notes(soup: BeautifulSoup) -> dict[str, list[str]]:
     return buckets
 
 
-def extract_minimal_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
+def extract_minimal_image_urls(
+    soup: BeautifulSoup, base_url: str, perfume_id: str
+) -> list[str]:
     """
     Keep downloads minimal and useful:
     - JSON-LD Product `image`
@@ -345,7 +628,7 @@ def extract_minimal_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
             continue
         seen.add(abs_u)
         normed.append(abs_u)
-    return normed
+    return filter_perfume_image_urls(normed, perfume_id=perfume_id)
 
 
 def infer_ext_from_content_type(ct: str) -> str:
@@ -459,7 +742,18 @@ def parse_perfume(html: str, url: str) -> tuple[dict[str, Any], list[str]]:
     og_title = soup.select_one('meta[property="og:title"]')
     og_desc = soup.select_one('meta[property="og:description"]')
 
+    # Prefer DOM H1; fall back to JSON-LD; then og:title / <title>.
+    brand = None
+    b = prod0.get("brand") if isinstance(prod0, dict) else None
+    if isinstance(b, dict) and isinstance(b.get("name"), str):
+        brand = b["name"].strip()
+    elif isinstance(b, str):
+        brand = b.strip()
+
+    h1_name, name_extras = extract_name_from_dom(soup, brand=brand)
+
     title_text = pick_first_str(
+        h1_name,
         (prod0.get("name") if isinstance(prod0, dict) else None),
         (og_title.get("content") if og_title else None),
         (soup.title.string if soup.title else None),
@@ -469,13 +763,6 @@ def parse_perfume(html: str, url: str) -> tuple[dict[str, Any], list[str]]:
         (og_desc.get("content") if og_desc else None),
     )
 
-    brand = None
-    b = prod0.get("brand") if isinstance(prod0, dict) else None
-    if isinstance(b, dict) and isinstance(b.get("name"), str):
-        brand = b["name"].strip()
-    elif isinstance(b, str):
-        brand = b.strip()
-
     page_text = soup.get_text(" ", strip=True)
     rating, votes = extract_rating_votes_from_text(page_text)
     longevity_score, sillage_score = extract_longevity_sillage_scores(page_text)
@@ -483,7 +770,8 @@ def parse_perfume(html: str, url: str) -> tuple[dict[str, Any], list[str]]:
     notes = extract_notes(soup)
     perf_pcts = extract_season_daynight_percent(html)
 
-    images = extract_minimal_image_urls(soup, base_url=url)
+    pid = perfume_id_from_url(url)
+    images = extract_minimal_image_urls(soup, base_url=url, perfume_id=pid)
 
     meta: dict[str, Any] = {
         "id": None,  # filled after slug is computed
@@ -495,6 +783,7 @@ def parse_perfume(html: str, url: str) -> tuple[dict[str, Any], list[str]]:
         "name": title_text,
         "brand": brand,
         "description": desc_text,
+        "name_extras": name_extras,
         "rating": {"value": rating, "votes": votes},
         "main_accords": accords,
         "notes": notes,
@@ -566,6 +855,24 @@ def scrape_one_perfume(
     meta["source"]["final_url"] = fetch.final_url
     meta["source"]["html_sha256"] = sha256_text(html)
     meta["source"]["used_playwright"] = fetch.used_playwright
+    meta["source"]["fetched_with"] = "playwright" if fetch.used_playwright else "requests"
+    if fetch.extracted:
+        meta["source"]["playwright_extracted"] = fetch.extracted
+        # Prefer Playwright-extracted slider values when available.
+        perf = meta.get("performance") or {}
+        if isinstance(perf, dict):
+            seasonality = (fetch.extracted.get("seasonality") if isinstance(fetch.extracted, dict) else None) or {}
+            daynight = (fetch.extracted.get("daynight") if isinstance(fetch.extracted, dict) else None) or {}
+            if isinstance(seasonality, dict) and seasonality:
+                perf["seasonality"] = {
+                    "spring": seasonality.get("spring"),
+                    "summer": seasonality.get("summer"),
+                    "fall": seasonality.get("fall"),
+                    "winter": seasonality.get("winter"),
+                }
+            if isinstance(daynight, dict) and daynight:
+                perf["daynight"] = {"day": daynight.get("day"), "night": daynight.get("night")}
+            meta["performance"] = perf
     meta["images"] = {"main": main_rel, "extra": extra_rel}
 
     write_json(perfume_dir / "meta.json", meta)
