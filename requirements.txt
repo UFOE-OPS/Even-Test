@@ -1,0 +1,12 @@
+beautifulsoup4
+lxml
+requests
+tqdm
+python-slugify
+pillow
+
+# Optional: only needed if Fragrantica shows an interstitial page.
+playwright
+
+# Optional: OAuth-based Reddit ingestion (recommended if you have credentials).
+praw
