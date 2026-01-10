@@ -8,7 +8,9 @@ Constraints implemented:
 - Resume/restart safe: does not re-scrape `done` unless `--force`.
 - Multi-worker safe: simple row claiming with `BEGIN IMMEDIATE` + conditional UPDATE.
 - Output structure is ID-based and stable:
-    data/fragrantica/<perfume_id>/
+- Each scraped perfume is assigned a consecutive local `scrape_id` (1..N) stored in SQLite.
+  Output folder uses that `scrape_id` to avoid slug-like naming.
+    data/fragrantica/<scrape_id>/
       meta.json
       html/page.html (optional)
       images/main.<ext>              (required: main product/bottle photo)
@@ -142,6 +144,14 @@ def init_db(db_path: str) -> sqlite3.Connection:
           last_error TEXT
         );
 
+        -- Consecutive local IDs for website-friendly dataset paths.
+        -- Assigned on first scrape attempt (or earlier if desired), stable thereafter.
+        CREATE TABLE IF NOT EXISTS scrape_ids (
+          scrape_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          perfume_id TEXT UNIQUE NOT NULL,
+          created_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS perfumes (
           perfume_id TEXT PRIMARY KEY,
           url TEXT UNIQUE NOT NULL,
@@ -160,6 +170,25 @@ def init_db(db_path: str) -> sqlite3.Connection:
         """
     )
     return conn
+
+
+def get_or_create_scrape_id(conn: sqlite3.Connection, perfume_id: str) -> int:
+    """
+    Allocate or fetch a consecutive local integer id (1..N) for a perfume_id.
+    This is used for output folder naming (website-friendly, no slug naming).
+    """
+    pid = (perfume_id or "").strip()
+    if not pid:
+        raise ValueError("perfume_id is required to allocate scrape_id")
+    now = utc_now_iso()
+    conn.execute(
+        "INSERT OR IGNORE INTO scrape_ids(perfume_id, created_at) VALUES (?, ?)",
+        (pid, now),
+    )
+    row = conn.execute("SELECT scrape_id FROM scrape_ids WHERE perfume_id=?", (pid,)).fetchone()
+    if not row or row["scrape_id"] is None:
+        raise RuntimeError(f"Could not allocate scrape_id for perfume_id={pid}")
+    return int(row["scrape_id"])
 
 
 def upsert_frontier(conn: sqlite3.Connection, perfume_id: str, url: str, source: str) -> bool:
@@ -1295,6 +1324,8 @@ def fetch_random_perfume_url(allow_playwright: bool = True) -> str:
 def scrape_and_write(
     perfume_url: str,
     out_root: Path,
+    out_folder: str,
+    scrape_id: int,
     allow_playwright: bool,
     save_html: bool,
     max_images: int,
@@ -1353,7 +1384,7 @@ def scrape_and_write(
         if isinstance(dn, dict):
             sliders["daynight"] = {"day": dn.get("day"), "night": dn.get("night")}
 
-    root = out_root / pid
+    root = out_root / out_folder
     ensure_dir(root)
 
     html_path: Optional[Path] = None
@@ -1377,6 +1408,15 @@ def scrape_and_write(
     main_image_rel: Optional[str] = None
     if main_url:
         ext = _ext_from_url(main_url)
+        # Ensure a single deterministic main file on reruns (remove main.* leftovers).
+        try:
+            for old in images_dir.glob("main.*"):
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         content = download_bytes(sess, main_url, timeout_s=30)
         if content:
             out_path = images_dir / f"main{ext}"
@@ -1437,6 +1477,7 @@ def scrape_and_write(
     scraped_at = utc_now_iso()
 
     meta: dict[str, Any] = {
+        "scrape_id": int(scrape_id),
         "perfume_id": pid,
         "source": {
             "site": "fragrantica",
@@ -1564,9 +1605,12 @@ def cmd_scrape_one(args: argparse.Namespace) -> None:
         return
 
     try:
+        scrape_id = get_or_create_scrape_id(conn, pid)
         meta, meta_path, html_path = scrape_and_write(
             perfume_url=url,
             out_root=Path(args.out).expanduser().resolve(),
+            out_folder=str(scrape_id),
+            scrape_id=scrape_id,
             allow_playwright=not args.no_playwright,
             save_html=not args.no_html,
             max_images=args.max_images,
@@ -1635,9 +1679,12 @@ def cmd_work(args: argparse.Namespace) -> None:
             continue
 
         try:
+            scrape_id = get_or_create_scrape_id(conn, pid)
             meta, meta_path, html_path = scrape_and_write(
                 perfume_url=url,
                 out_root=out_root,
+                out_folder=str(scrape_id),
+                scrape_id=scrape_id,
                 allow_playwright=not args.no_playwright,
                 save_html=not args.no_html,
                 max_images=args.max_images,
@@ -1746,9 +1793,12 @@ def cmd_scrape_random(args: argparse.Namespace) -> None:
             continue
 
         try:
+            scrape_id = get_or_create_scrape_id(conn, pid)
             meta, meta_path, html_path = scrape_and_write(
                 perfume_url=url,
                 out_root=out_root,
+                out_folder=str(scrape_id),
+                scrape_id=scrape_id,
                 allow_playwright=not args.no_playwright,
                 save_html=not args.no_html,
                 max_images=args.max_images,
