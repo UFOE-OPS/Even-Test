@@ -300,6 +300,11 @@ def should_skip_done(conn: sqlite3.Connection, perfume_id: str, force: bool) -> 
     return bool(row and row["status"] == "done")
 
 
+def get_frontier_status(conn: sqlite3.Connection, perfume_id: str) -> Optional[str]:
+    row = conn.execute("SELECT status FROM frontier WHERE perfume_id=?", (perfume_id,)).fetchone()
+    return str(row["status"]) if row and row.get("status") is not None else None
+
+
 # ---------------------------
 # Fetching (requests + optional Playwright)
 # ---------------------------
@@ -1251,6 +1256,37 @@ def extract_notes_with_strength(soup: BeautifulSoup) -> dict[str, list[dict[str,
     return groups
 
 
+def fetch_random_perfume_url(allow_playwright: bool = True) -> str:
+    """
+    Fetch a random perfume URL by hitting Fragrantica's random endpoint(s).
+    Returns the canonicalized final URL (should contain "-<id>.html").
+    """
+    candidates = [
+        "https://www.fragrantica.com/perfume/random.html",
+        "https://www.fragrantica.com/perfume/random",
+        "https://www.fragrantica.com/random.html",
+    ]
+    last_err: Optional[str] = None
+    for u in candidates:
+        try:
+            r = fetch_html(u, allow_playwright_fallback=allow_playwright)
+            final = canonicalize_url(r.final_url)
+            if perfume_id_from_url(final):
+                return final
+            # Some random endpoints might return HTML with a perfume link rather than redirect.
+            soup = BeautifulSoup(r.html, "lxml")
+            a = soup.select_one('a[href*="/perfume/"][href*=".html"]')
+            if a and isinstance(a.get("href"), str):
+                maybe = canonicalize_url(urljoin(final, a.get("href")))
+                if perfume_id_from_url(maybe):
+                    return maybe
+            last_err = f"random_endpoint_did_not_yield_perfume_url:{u}"
+        except Exception as e:
+            last_err = repr(e)
+            continue
+    raise RuntimeError(last_err or "Could not resolve random perfume URL")
+
+
 # ---------------------------
 # Scrape + write outputs (ID-based folders)
 # ---------------------------
@@ -1667,6 +1703,86 @@ def cmd_stats(args: argparse.Namespace) -> None:
     print(json.dumps(out, indent=2))
 
 
+def cmd_scrape_random(args: argparse.Namespace) -> None:
+    """
+    Scrape random perfumes, while deduping via SQLite.
+
+    Behavior:
+    - Uses DB as memory: won't scrape duplicates unless --force.
+    - Will keep fetching random perfumes until it successfully processes --count new ones,
+      or hits a safety max attempts limit.
+    """
+    conn = init_db(args.db)
+    out_root = Path(args.out).expanduser().resolve()
+    ensure_dir(out_root)
+
+    target = int(args.count)
+    if target <= 0:
+        raise SystemExit("--count must be >= 1")
+
+    processed = 0
+    attempts = 0
+    max_attempts = int(args.max_attempts) if int(args.max_attempts) > 0 else target * 20
+
+    while processed < target and attempts < max_attempts:
+        attempts += 1
+        try:
+            url = fetch_random_perfume_url(allow_playwright=not args.no_playwright)
+        except Exception as e:
+            _warn("random_fetch_failed", error=repr(e))
+            time.sleep(1.0)
+            continue
+
+        pid = perfume_id_from_url(url) or sha256_text(url)[:16]
+
+        # Ensure frontier row exists for memory/deduping.
+        upsert_frontier(conn, pid, url, source="random:scrape-random")
+        status = get_frontier_status(conn, pid)
+
+        # Skip duplicates unless forced.
+        if not args.force and status == "done":
+            continue
+        if not args.force and status == "in_progress":
+            continue
+
+        try:
+            meta, meta_path, html_path = scrape_and_write(
+                perfume_url=url,
+                out_root=out_root,
+                allow_playwright=not args.no_playwright,
+                save_html=not args.no_html,
+                max_images=args.max_images,
+                include_photogram=not args.no_photogram,
+                download_all_images=bool(args.download_all_images),
+                write_notes_map=bool(args.write_notes_map),
+            )
+            update_job_status_done(
+                conn=conn,
+                perfume_id=pid,
+                url=url,
+                meta_path=meta_path,
+                html_path=html_path,
+                fetched_with=(meta.get("source") or {}).get("fetched_with") or "",
+                scraped_at=(meta.get("source") or {}).get("scraped_at") or "",
+                brand=meta.get("brand"),
+                name=meta.get("name"),
+                rating=(meta.get("rating") or {}).get("value"),
+                votes=(meta.get("rating") or {}).get("votes"),
+            )
+            processed += 1
+            print(json.dumps({"ok": True, "perfume_id": pid, "url": url, "out": str(meta_path.parent)}, indent=2))
+        except BlockedError as e:
+            update_job_status_failed(conn, pid, repr(e), max_tries=args.max_tries)
+            _warn("blocked", perfume_id=pid, url=url, error=str(e))
+            time.sleep(2.0)
+        except Exception as e:
+            update_job_status_failed(conn, pid, repr(e), max_tries=args.max_tries)
+            _warn("scrape_failed", perfume_id=pid, url=url, error=repr(e))
+            time.sleep(1.0)
+
+    print(json.dumps({"requested": target, "processed": processed, "attempts": attempts}, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Fragrantica harvester (SQLite-backed)")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help="SQLite db path (default: scrape.db)")
@@ -1720,6 +1836,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stats = sub.add_parser("stats", help="Show totals queued/in_progress/done/failed and recent errors")
     p_stats.set_defaults(func=cmd_stats)
+
+    p_rand = sub.add_parser("scrape-random", help="Scrape random perfume pages (deduped via SQLite)")
+    p_rand.add_argument("--count", type=int, default=10, help="How many new random perfumes to scrape (default: 10)")
+    p_rand.add_argument(
+        "--max-attempts",
+        type=int,
+        default=0,
+        help="Safety cap for random fetch attempts (0 = auto)",
+    )
+    p_rand.add_argument("--out", default="data/fragrantica", help="Output root folder")
+    p_rand.add_argument("--max-tries", type=int, default=MAX_TRIES_DEFAULT, help="Retries before blocked")
+    p_rand.add_argument("--max-images", type=int, default=15, help="Max images (heroes + gallery) (default: 15)")
+    p_rand.add_argument("--no-playwright", action="store_true", help="Disable Playwright fallback")
+    p_rand.add_argument("--no-html", action="store_true", help="Do not save html/page.html snapshots")
+    p_rand.add_argument("--no-photogram", action="store_true", help="Disable photogram images in gallery")
+    p_rand.add_argument(
+        "--download-all-images",
+        action="store_true",
+        help="Download extra images (heroes + gallery). Default is main image only.",
+    )
+    g_nm3 = p_rand.add_mutually_exclusive_group()
+    g_nm3.add_argument("--write-notes-map", dest="write_notes_map", action="store_true", default=True)
+    g_nm3.add_argument("--no-write-notes-map", dest="write_notes_map", action="store_false")
+    p_rand.add_argument("--force", action="store_true", help="Re-scrape even if already done")
+    p_rand.set_defaults(func=cmd_scrape_random)
 
     return p
 
