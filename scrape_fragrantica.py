@@ -8,12 +8,15 @@ Constraints implemented:
 - Resume/restart safe: does not re-scrape `done` unless `--force`.
 - Multi-worker safe: simple row claiming with `BEGIN IMMEDIATE` + conditional UPDATE.
 - Output structure is ID-based and stable:
-    data/fragrantica/<perfume_id>/
+- Each scraped perfume is assigned a consecutive local `scrape_id` (1..N) stored in SQLite.
+  Output folder uses that `scrape_id` to avoid slug-like naming.
+    data/fragrantica/<scrape_id>/
       meta.json
       html/page.html (optional)
-      images/hero_og.jpg
-      images/hero_twitter.jpg (optional)
-      images/gallery/*.jpg (optional, capped)
+      images/main.<ext>              (required: main product/bottle photo)
+      images/hero_og.jpg             (optional; only with --download-all-images)
+      images/hero_twitter.jpg        (optional; only with --download-all-images)
+      images/gallery/*.jpg           (optional, capped; only with --download-all-images)
 
 Usage examples:
 
@@ -42,6 +45,7 @@ import os
 import random
 import re
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -140,6 +144,14 @@ def init_db(db_path: str) -> sqlite3.Connection:
           last_error TEXT
         );
 
+        -- Consecutive local IDs for website-friendly dataset paths.
+        -- Assigned on first scrape attempt (or earlier if desired), stable thereafter.
+        CREATE TABLE IF NOT EXISTS scrape_ids (
+          scrape_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          perfume_id TEXT UNIQUE NOT NULL,
+          created_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS perfumes (
           perfume_id TEXT PRIMARY KEY,
           url TEXT UNIQUE NOT NULL,
@@ -158,6 +170,25 @@ def init_db(db_path: str) -> sqlite3.Connection:
         """
     )
     return conn
+
+
+def get_or_create_scrape_id(conn: sqlite3.Connection, perfume_id: str) -> int:
+    """
+    Allocate or fetch a consecutive local integer id (1..N) for a perfume_id.
+    This is used for output folder naming (website-friendly, no slug naming).
+    """
+    pid = (perfume_id or "").strip()
+    if not pid:
+        raise ValueError("perfume_id is required to allocate scrape_id")
+    now = utc_now_iso()
+    conn.execute(
+        "INSERT OR IGNORE INTO scrape_ids(perfume_id, created_at) VALUES (?, ?)",
+        (pid, now),
+    )
+    row = conn.execute("SELECT scrape_id FROM scrape_ids WHERE perfume_id=?", (pid,)).fetchone()
+    if not row or row["scrape_id"] is None:
+        raise RuntimeError(f"Could not allocate scrape_id for perfume_id={pid}")
+    return int(row["scrape_id"])
 
 
 def upsert_frontier(conn: sqlite3.Connection, perfume_id: str, url: str, source: str) -> bool:
@@ -296,6 +327,11 @@ def should_skip_done(conn: sqlite3.Connection, perfume_id: str, force: bool) -> 
         return False
     row = conn.execute("SELECT status FROM frontier WHERE perfume_id=?", (perfume_id,)).fetchone()
     return bool(row and row["status"] == "done")
+
+
+def get_frontier_status(conn: sqlite3.Connection, perfume_id: str) -> Optional[str]:
+    row = conn.execute("SELECT status FROM frontier WHERE perfume_id=?", (perfume_id,)).fetchone()
+    return str(row["status"]) if row and row.get("status") is not None else None
 
 
 # ---------------------------
@@ -645,6 +681,50 @@ def clean_name_from_heading(h1_text: str, brand: Optional[str]) -> tuple[Optiona
     return (t2 or None), extras
 
 
+def _warn(msg: str, **kv: Any) -> None:
+    payload = {"level": "warning", "msg": msg}
+    if kv:
+        payload.update(kv)
+    try:
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
+    except Exception:
+        print(f"WARNING: {msg}", file=sys.stderr)
+
+
+def extract_clean_name(soup: BeautifulSoup, fallback_name: str) -> str:
+    """
+    Extract a stable, short perfume name from the page DOM.
+
+    Fragrantica sometimes includes SEO-ish tails like:
+      "X cologne - a new fragrance for men ..."
+    """
+
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
+
+    # Preferred: H1 title
+    raw = norm(text_of(soup.select_one("h1")) or "")
+    if not raw:
+        # Fallback: og:title is sometimes present and cleaner than body text.
+        ogt = soup.select_one('meta[property="og:title"]')
+        raw = norm((ogt.get("content") if ogt else "") or "")
+    if not raw:
+        raw = norm(fallback_name)
+
+    # Remove common SEO tail patterns.
+    # Examples observed: "- a new fragrance for women and men", "- a new fragrance for men 2024"
+    raw = re.sub(r"\s*-\s*a new fragrance.*$", "", raw, flags=re.I).strip()
+    raw = re.sub(
+        r"\b(cologne|perfume|parfum)\s*-\s*a new fragrance.*$",
+        "",
+        raw,
+        flags=re.I,
+    ).strip()
+    # Last resort: split on " - " and keep the left side.
+    raw = re.split(r"\s+-\s+", raw, maxsplit=1)[0].strip()
+    return raw or norm(fallback_name) or "Unknown"
+
+
 def extract_main_accords_dom(soup: BeautifulSoup) -> list[str]:
     def is_valid_accord_label(label: str) -> bool:
         l = re.sub(r"\s+", " ", (label or "")).strip()
@@ -850,6 +930,392 @@ def download_bytes(session: requests.Session, url: str, timeout_s: int = 30) -> 
         return None
 
 
+def _looks_like_bottle_image(url: str, perfume_id: str) -> bool:
+    u = (url or "").lower()
+    pid = (perfume_id or "").strip()
+    if pid and pid in u:
+        return True
+    if "/mdimg/perfume/" in u or "/mdimg/perfume-thumbs/" in u:
+        if "/mdimg/perfume-social-cards/" in u:
+            return False
+        return True
+    return False
+
+
+def _probe_url_exists(url: str, timeout_s: float = 6.0) -> bool:
+    """
+    Lightweight existence probe for image URLs.
+    Prefer HEAD, fallback to GET(stream=True). Keep timeouts short.
+    """
+    if not url:
+        return False
+    headers = {"User-Agent": USER_AGENT, "Accept": "image/*,*/*;q=0.8"}
+    try:
+        r = requests.head(url, headers=headers, allow_redirects=True, timeout=timeout_s)
+        if r.status_code and r.status_code < 400:
+            return True
+    except Exception:
+        pass
+
+    try:
+        r2 = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout_s, stream=True)
+        ok = bool(r2.status_code and r2.status_code < 400)
+        try:
+            r2.close()
+        except Exception:
+            pass
+        return ok
+    except Exception:
+        return False
+
+
+def _ext_from_url(url: str) -> str:
+    path = urlparse(url).path.lower()
+    m = re.search(r"\.(jpg|jpeg|png|webp|gif)$", path)
+    if m:
+        ext = m.group(1)
+        return ".jpg" if ext == "jpeg" else f".{ext}"
+    return ".jpg"
+
+
+def _parse_px(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)) and v >= 0:
+        return int(v)
+    s = str(v).strip().lower()
+    m = re.search(r"(\d+)", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _img_dims_from_tag(img: Any) -> tuple[Optional[int], Optional[int]]:
+    """
+    Try to infer width/height in px from <img> attributes or inline styles.
+    """
+    if img is None:
+        return None, None
+
+    w = _parse_px(img.get("width"))
+    h = _parse_px(img.get("height"))
+    if w is not None or h is not None:
+        return w, h
+
+    style = (img.get("style") or "") if hasattr(img, "get") else ""
+    if isinstance(style, str) and style:
+        mw = re.search(r"width\s*:\s*(\d+)\s*px", style, flags=re.I)
+        mh = re.search(r"height\s*:\s*(\d+)\s*px", style, flags=re.I)
+        w2 = int(mw.group(1)) if mw else None
+        h2 = int(mh.group(1)) if mh else None
+        if w2 is not None or h2 is not None:
+            return w2, h2
+
+    # Sometimes the size is on the parent container.
+    parent = getattr(img, "parent", None)
+    if parent is not None and hasattr(parent, "get"):
+        pstyle = parent.get("style") or ""
+        if isinstance(pstyle, str) and pstyle:
+            mw = re.search(r"width\s*:\s*(\d+)\s*px", pstyle, flags=re.I)
+            mh = re.search(r"height\s*:\s*(\d+)\s*px", pstyle, flags=re.I)
+            w3 = int(mw.group(1)) if mw else None
+            h3 = int(mh.group(1)) if mh else None
+            if w3 is not None or h3 is not None:
+                return w3, h3
+
+    return None, None
+
+
+def get_main_product_image(perfume_id: str, soup: BeautifulSoup, base_url: str) -> Optional[str]:
+    """
+    Return the best “bottle/product” image URL for a fragrance.
+
+    Priority:
+    (a) og:image if it contains perfume_id OR looks like a bottle image
+    (b) deterministic fimgs.net patterns based on perfume_id (probe existence)
+    (c) fallback: scan <img> tags for likely bottle image and choose biggest by pixel area
+    """
+    pid = (perfume_id or "").strip()
+    if not pid:
+        return None
+
+    # (a) og:image
+    og = extract_meta_image_url(soup, "og:image")
+    if og:
+        og_abs = urljoin(base_url, og)
+        if (pid and pid in og_abs) or _looks_like_bottle_image(og_abs, pid):
+            return og_abs
+
+    # (b) known patterns (probe)
+    candidates: list[str] = []
+    for ext in (".jpg", ".png"):
+        candidates.extend(
+            [
+                f"https://fimgs.net/mdimg/perfume-thumbs/375x500.{pid}{ext}",
+                f"https://fimgs.net/mdimg/perfume/m.{pid}{ext}",
+                f"https://fimgs.net/mdimg/perfume/375x500.{pid}{ext}",
+            ]
+        )
+    for u in candidates:
+        if _probe_url_exists(u, timeout_s=6.0):
+            return u
+
+    # (c) scan <img> tags
+    best_url: Optional[str] = None
+    best_score: tuple[int, int] = (-1, -1)  # (area_or_dim, -dom_idx)
+    dom_idx = 0
+    for img in soup.select("img"):
+        dom_idx += 1
+        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
+        if not isinstance(src, str) or not src.strip():
+            continue
+        u = urljoin(base_url, src.strip())
+        ul = u.lower()
+        if pid not in ul:
+            continue
+        if "/mdimg/perfume/" not in ul and "/mdimg/perfume-thumbs/" not in ul:
+            continue
+        if "/mdimg/perfume-social-cards/" in ul:
+            continue
+
+        w, h = _img_dims_from_tag(img)
+        if w is not None and h is not None:
+            score = (w * h, -dom_idx)
+        elif w is not None:
+            score = (w, -dom_idx)
+        elif h is not None:
+            score = (h, -dom_idx)
+        else:
+            # Try to infer from URL patterns like "375x500."
+            m = re.search(r"/(\d+)x(\d+)\.", ul)
+            if m:
+                try:
+                    ww = int(m.group(1))
+                    hh = int(m.group(2))
+                    score = (ww * hh, -dom_idx)
+                except Exception:
+                    score = (0, -dom_idx)
+            else:
+                score = (0, -dom_idx)
+
+        if score > best_score:
+            best_score = score
+            best_url = u
+
+    return best_url
+
+
+# ---------------------------
+# Notes pyramid with strength (DOM-based)
+# ---------------------------
+
+
+def _clean_note_name(name: str) -> str:
+    s = (name or "").replace("\xa0", " ").strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    # Remove common garbage artifacts while keeping original casing stable.
+    s = s.replace("�", "").strip()
+    return s
+
+
+def _extract_note_label(img: Any) -> str:
+    alt = img.get("alt") if hasattr(img, "get") else None
+    title = img.get("title") if hasattr(img, "get") else None
+    s = pick_first_str(alt if isinstance(alt, str) else None, title if isinstance(title, str) else None)
+    if s:
+        return _clean_note_name(s)
+
+    # Try anchor text
+    a = img.find_parent("a") if hasattr(img, "find_parent") else None
+    if a is not None:
+        t = text_of(a)
+        if t:
+            return _clean_note_name(t)
+
+    # Try parent text
+    p = getattr(img, "parent", None)
+    t2 = text_of(p)
+    if t2:
+        return _clean_note_name(t2)
+    return ""
+
+
+def _strength_from_dims(w: Optional[int], h: Optional[int]) -> int:
+    if w is not None and h is not None:
+        return int(w) * int(h)
+    if w is not None:
+        return int(w)
+    return 0
+
+
+def _find_heading_tags(soup: BeautifulSoup, label: str) -> list[Any]:
+    """
+    Return tags whose text looks like the desired heading (e.g. "Top Notes").
+    """
+    out: list[Any] = []
+    for t in soup.find_all(True):
+        tt = text_of(t) or ""
+        if not tt:
+            continue
+        if re.fullmatch(rf"\s*{re.escape(label)}\s*", tt, flags=re.I):
+            out.append(t)
+    return out
+
+
+def _find_notes_container_from_heading(heading_tag: Any) -> Optional[Any]:
+    """
+    Heuristic: walk forward in DOM until we find a container that has
+    multiple note images (usually /mdimg/sastojci/ or /mdimg/notes/).
+    """
+    if heading_tag is None:
+        return None
+
+    def looks_like_notes_container(tag: Any) -> bool:
+        if tag is None or not hasattr(tag, "select"):
+            return False
+        # Avoid selecting the whole page.
+        if getattr(tag, "name", "") in ("html", "body"):
+            return False
+        imgs = tag.select("img")
+        if len(imgs) < 1:
+            return False
+        noteish = 0
+        for img in imgs:
+            src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
+            if not isinstance(src, str):
+                continue
+            sl = src.lower()
+            if "/mdimg/sastojci/" in sl or "/mdimg/notes/" in sl:
+                noteish += 1
+        return noteish >= 1
+
+    # Prefer nearby siblings: typically the notes container follows the heading.
+    sib = heading_tag.find_next_sibling()
+    if looks_like_notes_container(sib):
+        return sib
+    if heading_tag.parent is not None:
+        sib2 = heading_tag.parent.find_next_sibling()
+        if looks_like_notes_container(sib2):
+            return sib2
+
+    # If the heading and images share a tight wrapper, allow the parent (but never body/html).
+    parent = heading_tag.parent
+    if looks_like_notes_container(parent):
+        return parent
+
+    # Forward scan in document order, but stop at the next notes heading.
+    steps = 0
+    for el in heading_tag.find_all_next(True, limit=120):
+        steps += 1
+        t = (text_of(el) or "").strip()
+        if t and re.fullmatch(r"(top|middle|base)\s+notes", t, flags=re.I):
+            break
+        if looks_like_notes_container(el):
+            return el
+    return None
+
+
+def extract_notes_with_strength(soup: BeautifulSoup) -> dict[str, list[dict[str, Any]]]:
+    """
+    DOM-based extraction of note pyramid with per-note strength derived from image sizing.
+
+    Returns:
+      { "top": [...], "middle": [...], "base": [...] }
+    Each item:
+      {"note": str, "strength": int, "strength_norm": float}
+    """
+    groups: dict[str, list[dict[str, Any]]] = {"top": [], "middle": [], "base": []}
+    labels = {"top": "Top Notes", "middle": "Middle Notes", "base": "Base Notes"}
+
+    for key, heading_text in labels.items():
+        heading_tags = _find_heading_tags(soup, heading_text)
+        container = None
+        for h in heading_tags:
+            container = _find_notes_container_from_heading(h)
+            if container is not None:
+                break
+        if container is None:
+            continue
+
+        # Collect in DOM order, then dedupe case-insensitively (keep first occurrence).
+        items: list[dict[str, Any]] = []
+        seen_ci: set[str] = set()
+        dom_idx = 0
+        imgs = container.select("img")
+        for img in imgs:
+            dom_idx += 1
+            src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
+            if isinstance(src, str):
+                sl = src.lower()
+                # Strongly prefer note images, but don't hard-fail if Fragrantica changes paths.
+                if "/mdimg/sastojci/" not in sl and "/mdimg/notes/" not in sl:
+                    # Still allow, but only if it has a note label.
+                    pass
+
+            note = _extract_note_label(img)
+            if not note:
+                continue
+            kci = note.lower()
+            if kci in seen_ci:
+                continue
+            seen_ci.add(kci)
+
+            w, h = _img_dims_from_tag(img)
+            strength = _strength_from_dims(w, h)
+            if strength == 0 and (w is None and h is None):
+                # Keep it, but warn (once per note) that sizing couldn't be parsed.
+                _warn("note_size_missing", note=note, group=key)
+
+            items.append({"note": note, "strength": int(strength), "_dom_idx": dom_idx})
+
+        # Sort by strength DESC, tie-break by original DOM order.
+        items.sort(key=lambda x: (-int(x.get("strength") or 0), int(x.get("_dom_idx") or 0)))
+
+        max_strength = max((int(x.get("strength") or 0) for x in items), default=0)
+        for it in items:
+            s = int(it.get("strength") or 0)
+            it["strength_norm"] = float(s / max_strength) if max_strength > 0 else 0.0
+            it.pop("_dom_idx", None)
+
+        groups[key] = items
+
+    return groups
+
+
+def fetch_random_perfume_url(allow_playwright: bool = True) -> str:
+    """
+    Fetch a random perfume URL by hitting Fragrantica's random endpoint(s).
+    Returns the canonicalized final URL (should contain "-<id>.html").
+    """
+    candidates = [
+        "https://www.fragrantica.com/perfume/random.html",
+        "https://www.fragrantica.com/perfume/random",
+        "https://www.fragrantica.com/random.html",
+    ]
+    last_err: Optional[str] = None
+    for u in candidates:
+        try:
+            r = fetch_html(u, allow_playwright_fallback=allow_playwright)
+            final = canonicalize_url(r.final_url)
+            if perfume_id_from_url(final):
+                return final
+            # Some random endpoints might return HTML with a perfume link rather than redirect.
+            soup = BeautifulSoup(r.html, "lxml")
+            a = soup.select_one('a[href*="/perfume/"][href*=".html"]')
+            if a and isinstance(a.get("href"), str):
+                maybe = canonicalize_url(urljoin(final, a.get("href")))
+                if perfume_id_from_url(maybe):
+                    return maybe
+            last_err = f"random_endpoint_did_not_yield_perfume_url:{u}"
+        except Exception as e:
+            last_err = repr(e)
+            continue
+    raise RuntimeError(last_err or "Could not resolve random perfume URL")
+
+
 # ---------------------------
 # Scrape + write outputs (ID-based folders)
 # ---------------------------
@@ -858,15 +1324,17 @@ def download_bytes(session: requests.Session, url: str, timeout_s: int = 30) -> 
 def scrape_and_write(
     perfume_url: str,
     out_root: Path,
+    out_folder: str,
+    scrape_id: int,
     allow_playwright: bool,
     save_html: bool,
     max_images: int,
     include_photogram: bool,
+    download_all_images: bool,
+    write_notes_map: bool,
 ) -> tuple[dict[str, Any], Path, Optional[Path]]:
     url = canonicalize_url(perfume_url)
-    pid = perfume_id_from_url(url)
-    if not pid:
-        raise ValueError(f"Could not parse perfume_id from URL: {perfume_url}")
+    pid = perfume_id_from_url(url) or sha256_text(url)[:16]
 
     fetch = fetch_html(url, allow_playwright_fallback=allow_playwright)
     soup = BeautifulSoup(fetch.html, "lxml")
@@ -881,9 +1349,10 @@ def scrape_and_write(
     elif isinstance(b, str):
         brand = b.strip()
 
-    # Name: H1-based cleaning
-    h1 = text_of(soup.select_one("h1")) or ""
-    name, name_extras = clean_name_from_heading(h1, brand=brand)
+    # Name: DOM-based clean name (avoid SEO tails)
+    name_raw = text_of(soup.select_one("h1")) or ""
+    fallback_name, name_extras = clean_name_from_heading(name_raw, brand=brand)
+    name_clean = extract_clean_name(soup, fallback_name or name_raw or "")
 
     # Description: JSON-LD or og:description
     og_desc = soup.select_one('meta[property="og:description"]')
@@ -896,7 +1365,10 @@ def scrape_and_write(
     rating, votes = extract_rating_votes_from_text(page_text)
     longevity_score, sillage_score = extract_longevity_sillage_scores(page_text)
     accords = extract_main_accords_dom(soup)
-    notes = extract_notes(soup)
+    # Keep legacy notes (text-based) for debugging/back-compat, but primary output uses DOM+strength.
+    legacy_notes = extract_notes(soup)
+    notes_strength = extract_notes_with_strength(soup)
+    notes_ranked = {k: [x["note"] for x in v] for k, v in notes_strength.items()}
 
     sliders = extract_season_daynight_percent_fallback(fetch.html)
     if fetch.extracted and isinstance(fetch.extracted, dict):
@@ -912,7 +1384,7 @@ def scrape_and_write(
         if isinstance(dn, dict):
             sliders["daynight"] = {"day": dn.get("day"), "night": dn.get("night")}
 
-    root = out_root / pid
+    root = out_root / out_folder
     ensure_dir(root)
 
     html_path: Optional[Path] = None
@@ -924,61 +1396,88 @@ def scrape_and_write(
 
     images_dir = root / "images"
     ensure_dir(images_dir)
-    gallery_dir = images_dir / "gallery"
-    ensure_dir(gallery_dir)
+    if download_all_images:
+        gallery_dir = images_dir / "gallery"
+        ensure_dir(gallery_dir)
 
     sess = requests.Session()
     sess.headers.update({"User-Agent": USER_AGENT, "Accept": "image/*,*/*;q=0.8"})
 
-    images_info = gather_image_urls(soup, base_url=fetch.final_url, perfume_id=pid, include_photogram=include_photogram)
+    # Required: deterministic main product image (bottle photo)
+    main_url = get_main_product_image(pid, soup, base_url=fetch.final_url)
+    main_image_rel: Optional[str] = None
+    if main_url:
+        ext = _ext_from_url(main_url)
+        # Ensure a single deterministic main file on reruns (remove main.* leftovers).
+        try:
+            for old in images_dir.glob("main.*"):
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        content = download_bytes(sess, main_url, timeout_s=30)
+        if content:
+            out_path = images_dir / f"main{ext}"
+            out_path.write_bytes(content)
+            main_image_rel = str(out_path.relative_to(root).as_posix())
+        else:
+            _warn("main_image_download_failed", perfume_id=pid, url=main_url)
+    else:
+        _warn("main_image_not_found", perfume_id=pid, url=url)
 
-    images_saved: dict[str, Any] = {"hero_og": None, "hero_twitter": None, "gallery": []}
+    # Optional: keep legacy heroes/gallery only when explicitly enabled
+    images_saved: dict[str, Any] = {"main": main_image_rel, "hero_og": None, "hero_twitter": None, "gallery": []}
+    if download_all_images:
+        images_info = gather_image_urls(soup, base_url=fetch.final_url, perfume_id=pid, include_photogram=include_photogram)
 
-    def save_named_hero(url0: Optional[str], filename: str) -> Optional[str]:
-        if not url0:
-            return None
-        content = download_bytes(sess, url0)
-        if not content:
-            return None
-        jpg = _try_convert_to_jpg(content)
-        out_path = images_dir / filename
-        out_path.write_bytes(jpg if jpg is not None else content)
-        return str(out_path.relative_to(root).as_posix())
+        def save_named_hero(url0: Optional[str], filename: str) -> Optional[str]:
+            if not url0:
+                return None
+            content2 = download_bytes(sess, url0)
+            if not content2:
+                return None
+            jpg2 = _try_convert_to_jpg(content2)
+            out_path2 = images_dir / filename
+            out_path2.write_bytes(jpg2 if jpg2 is not None else content2)
+            return str(out_path2.relative_to(root).as_posix())
 
-    images_saved["hero_og"] = save_named_hero(images_info.get("hero_og_url"), "hero_og.jpg")
-    images_saved["hero_twitter"] = save_named_hero(images_info.get("hero_twitter_url"), "hero_twitter.jpg")
+        images_saved["hero_og"] = save_named_hero(images_info.get("hero_og_url"), "hero_og.jpg")
+        images_saved["hero_twitter"] = save_named_hero(images_info.get("hero_twitter_url"), "hero_twitter.jpg")
 
-    # Gallery (strictly filtered); cap includes heroes within total max_images budget.
-    gallery_urls: list[str] = list(images_info.get("gallery_urls") or [])
-    hero_set = set([u for u in [images_info.get("hero_og_url"), images_info.get("hero_twitter_url")] if u])
-    gallery_urls = [u for u in gallery_urls if u not in hero_set]
+        # Gallery (strictly filtered); cap includes heroes within total max_images budget.
+        gallery_urls: list[str] = list(images_info.get("gallery_urls") or [])
+        hero_set = set([u for u in [images_info.get("hero_og_url"), images_info.get("hero_twitter_url")] if u])
+        gallery_urls = [u for u in gallery_urls if u not in hero_set]
 
-    photogram_count = 0
-    gallery_budget = max(0, max_images - 2)
-    for u in gallery_urls:
-        if len(images_saved["gallery"]) >= gallery_budget:
-            break
-        if "fimgs.net/photogram/" in u:
-            if photogram_count >= 10:
+        photogram_count = 0
+        gallery_budget = max(0, max_images - 2)
+        for u in gallery_urls:
+            if len(images_saved["gallery"]) >= gallery_budget:
+                break
+            if "fimgs.net/photogram/" in u:
+                if photogram_count >= 10:
+                    continue
+                photogram_count += 1
+
+            content3 = download_bytes(sess, u)
+            if not content3:
                 continue
-            photogram_count += 1
-
-        content = download_bytes(sess, u)
-        if not content:
-            continue
-        jpg = _try_convert_to_jpg(content) or content
-        digest = hashlib.sha256(jpg).hexdigest()[:16]
-        out_path = gallery_dir / f"{digest}.jpg"
-        if not out_path.exists():
-            out_path.write_bytes(jpg)
-        images_saved["gallery"].append(str(out_path.relative_to(root).as_posix()))
-        time.sleep(0.15)
+            jpg3 = _try_convert_to_jpg(content3) or content3
+            digest = hashlib.sha256(jpg3).hexdigest()[:16]
+            out_path3 = (images_dir / "gallery") / f"{digest}.jpg"
+            if not out_path3.exists():
+                out_path3.write_bytes(jpg3)
+            images_saved["gallery"].append(str(out_path3.relative_to(root).as_posix()))
+            time.sleep(0.15)
 
     fetched_with = "playwright" if fetch.used_playwright else "requests"
     final_url = canonicalize_url(fetch.final_url)
     scraped_at = utc_now_iso()
 
     meta: dict[str, Any] = {
+        "scrape_id": int(scrape_id),
         "perfume_id": pid,
         "source": {
             "site": "fragrantica",
@@ -989,12 +1488,16 @@ def scrape_and_write(
             "html_sha256": sha256_text(fetch.html),
         },
         "brand": brand,
-        "name": name,
+        "name": name_clean,
+        "name_raw": name_raw,
         "name_extras": name_extras,
         "description": desc,
         "rating": {"value": rating, "votes": votes},
         "main_accords": accords,
-        "notes": notes,
+        "main_image": main_image_rel,
+        "notes_ranked": notes_ranked,
+        "notes_strength": notes_strength,
+        "notes_legacy": legacy_notes,
         "performance": {
             "longevity_score": longevity_score,
             "sillage_score": sillage_score,
@@ -1005,6 +1508,16 @@ def scrape_and_write(
 
     meta_path = root / "meta.json"
     write_json(meta_path, meta)
+
+    if write_notes_map:
+        notes_map: dict[str, Any] = {
+            name_clean: {
+                "top_notes": notes_ranked.get("top") or [],
+                "middle_notes": notes_ranked.get("middle") or [],
+                "base_notes": notes_ranked.get("base") or [],
+            }
+        }
+        write_json(root / "notes_map.json", notes_map)
     return meta, meta_path, html_path
 
 
@@ -1082,9 +1595,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
 def cmd_scrape_one(args: argparse.Namespace) -> None:
     conn = init_db(args.db)
     url = canonicalize_url(args.url)
-    pid = perfume_id_from_url(url)
-    if not pid:
-        raise SystemExit(f"Could not parse perfume_id from URL: {args.url}")
+    pid = perfume_id_from_url(url) or sha256_text(url)[:16]
 
     # Ensure frontier row exists
     upsert_frontier(conn, pid, url, source="manual:scrape-one")
@@ -1094,13 +1605,18 @@ def cmd_scrape_one(args: argparse.Namespace) -> None:
         return
 
     try:
+        scrape_id = get_or_create_scrape_id(conn, pid)
         meta, meta_path, html_path = scrape_and_write(
             perfume_url=url,
             out_root=Path(args.out).expanduser().resolve(),
+            out_folder=str(scrape_id),
+            scrape_id=scrape_id,
             allow_playwright=not args.no_playwright,
             save_html=not args.no_html,
             max_images=args.max_images,
             include_photogram=not args.no_photogram,
+            download_all_images=bool(args.download_all_images),
+            write_notes_map=bool(args.write_notes_map),
         )
         update_job_status_done(
             conn=conn,
@@ -1163,13 +1679,18 @@ def cmd_work(args: argparse.Namespace) -> None:
             continue
 
         try:
+            scrape_id = get_or_create_scrape_id(conn, pid)
             meta, meta_path, html_path = scrape_and_write(
                 perfume_url=url,
                 out_root=out_root,
+                out_folder=str(scrape_id),
+                scrape_id=scrape_id,
                 allow_playwright=not args.no_playwright,
                 save_html=not args.no_html,
                 max_images=args.max_images,
                 include_photogram=not args.no_photogram,
+                download_all_images=bool(args.download_all_images),
+                write_notes_map=bool(args.write_notes_map),
             )
             update_job_status_done(
                 conn=conn,
@@ -1229,6 +1750,89 @@ def cmd_stats(args: argparse.Namespace) -> None:
     print(json.dumps(out, indent=2))
 
 
+def cmd_scrape_random(args: argparse.Namespace) -> None:
+    """
+    Scrape random perfumes, while deduping via SQLite.
+
+    Behavior:
+    - Uses DB as memory: won't scrape duplicates unless --force.
+    - Will keep fetching random perfumes until it successfully processes --count new ones,
+      or hits a safety max attempts limit.
+    """
+    conn = init_db(args.db)
+    out_root = Path(args.out).expanduser().resolve()
+    ensure_dir(out_root)
+
+    target = int(args.count)
+    if target <= 0:
+        raise SystemExit("--count must be >= 1")
+
+    processed = 0
+    attempts = 0
+    max_attempts = int(args.max_attempts) if int(args.max_attempts) > 0 else target * 20
+
+    while processed < target and attempts < max_attempts:
+        attempts += 1
+        try:
+            url = fetch_random_perfume_url(allow_playwright=not args.no_playwright)
+        except Exception as e:
+            _warn("random_fetch_failed", error=repr(e))
+            time.sleep(1.0)
+            continue
+
+        pid = perfume_id_from_url(url) or sha256_text(url)[:16]
+
+        # Ensure frontier row exists for memory/deduping.
+        upsert_frontier(conn, pid, url, source="random:scrape-random")
+        status = get_frontier_status(conn, pid)
+
+        # Skip duplicates unless forced.
+        if not args.force and status == "done":
+            continue
+        if not args.force and status == "in_progress":
+            continue
+
+        try:
+            scrape_id = get_or_create_scrape_id(conn, pid)
+            meta, meta_path, html_path = scrape_and_write(
+                perfume_url=url,
+                out_root=out_root,
+                out_folder=str(scrape_id),
+                scrape_id=scrape_id,
+                allow_playwright=not args.no_playwright,
+                save_html=not args.no_html,
+                max_images=args.max_images,
+                include_photogram=not args.no_photogram,
+                download_all_images=bool(args.download_all_images),
+                write_notes_map=bool(args.write_notes_map),
+            )
+            update_job_status_done(
+                conn=conn,
+                perfume_id=pid,
+                url=url,
+                meta_path=meta_path,
+                html_path=html_path,
+                fetched_with=(meta.get("source") or {}).get("fetched_with") or "",
+                scraped_at=(meta.get("source") or {}).get("scraped_at") or "",
+                brand=meta.get("brand"),
+                name=meta.get("name"),
+                rating=(meta.get("rating") or {}).get("value"),
+                votes=(meta.get("rating") or {}).get("votes"),
+            )
+            processed += 1
+            print(json.dumps({"ok": True, "perfume_id": pid, "url": url, "out": str(meta_path.parent)}, indent=2))
+        except BlockedError as e:
+            update_job_status_failed(conn, pid, repr(e), max_tries=args.max_tries)
+            _warn("blocked", perfume_id=pid, url=url, error=str(e))
+            time.sleep(2.0)
+        except Exception as e:
+            update_job_status_failed(conn, pid, repr(e), max_tries=args.max_tries)
+            _warn("scrape_failed", perfume_id=pid, url=url, error=repr(e))
+            time.sleep(1.0)
+
+    print(json.dumps({"requested": target, "processed": processed, "attempts": attempts}, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Fragrantica harvester (SQLite-backed)")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help="SQLite db path (default: scrape.db)")
@@ -1250,6 +1854,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--no-playwright", action="store_true", help="Disable Playwright fallback")
     p_work.add_argument("--no-html", action="store_true", help="Do not save html/page.html snapshots")
     p_work.add_argument("--no-photogram", action="store_true", help="Disable photogram images in gallery")
+    p_work.add_argument(
+        "--download-all-images",
+        action="store_true",
+        help="Download extra images (heroes + gallery). Default is main image only.",
+    )
+    g_nm = p_work.add_mutually_exclusive_group()
+    g_nm.add_argument("--write-notes-map", dest="write_notes_map", action="store_true", default=True)
+    g_nm.add_argument("--no-write-notes-map", dest="write_notes_map", action="store_false")
     p_work.add_argument("--force", action="store_true", help="Re-scrape even if already done")
     p_work.set_defaults(func=cmd_work)
 
@@ -1261,11 +1873,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_one.add_argument("--no-playwright", action="store_true", help="Disable Playwright fallback")
     p_one.add_argument("--no-html", action="store_true", help="Do not save html/page.html snapshots")
     p_one.add_argument("--no-photogram", action="store_true", help="Disable photogram images in gallery")
+    p_one.add_argument(
+        "--download-all-images",
+        action="store_true",
+        help="Download extra images (heroes + gallery). Default is main image only.",
+    )
+    g_nm2 = p_one.add_mutually_exclusive_group()
+    g_nm2.add_argument("--write-notes-map", dest="write_notes_map", action="store_true", default=True)
+    g_nm2.add_argument("--no-write-notes-map", dest="write_notes_map", action="store_false")
     p_one.add_argument("--force", action="store_true", help="Re-scrape even if already done")
     p_one.set_defaults(func=cmd_scrape_one)
 
     p_stats = sub.add_parser("stats", help="Show totals queued/in_progress/done/failed and recent errors")
     p_stats.set_defaults(func=cmd_stats)
+
+    p_rand = sub.add_parser("scrape-random", help="Scrape random perfume pages (deduped via SQLite)")
+    p_rand.add_argument("--count", type=int, default=10, help="How many new random perfumes to scrape (default: 10)")
+    p_rand.add_argument(
+        "--max-attempts",
+        type=int,
+        default=0,
+        help="Safety cap for random fetch attempts (0 = auto)",
+    )
+    p_rand.add_argument("--out", default="data/fragrantica", help="Output root folder")
+    p_rand.add_argument("--max-tries", type=int, default=MAX_TRIES_DEFAULT, help="Retries before blocked")
+    p_rand.add_argument("--max-images", type=int, default=15, help="Max images (heroes + gallery) (default: 15)")
+    p_rand.add_argument("--no-playwright", action="store_true", help="Disable Playwright fallback")
+    p_rand.add_argument("--no-html", action="store_true", help="Do not save html/page.html snapshots")
+    p_rand.add_argument("--no-photogram", action="store_true", help="Disable photogram images in gallery")
+    p_rand.add_argument(
+        "--download-all-images",
+        action="store_true",
+        help="Download extra images (heroes + gallery). Default is main image only.",
+    )
+    g_nm3 = p_rand.add_mutually_exclusive_group()
+    g_nm3.add_argument("--write-notes-map", dest="write_notes_map", action="store_true", default=True)
+    g_nm3.add_argument("--no-write-notes-map", dest="write_notes_map", action="store_false")
+    p_rand.add_argument("--force", action="store_true", help="Re-scrape even if already done")
+    p_rand.set_defaults(func=cmd_scrape_random)
 
     return p
 
